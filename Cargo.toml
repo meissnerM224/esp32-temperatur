@@ -28,6 +28,9 @@ esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-tim
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 ssd1306 = "0.9"
 embedded-graphics = "0.8"
+aht20-driver = { version = "1.2.2", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }  # Datenstrukturen
+serde_json = { version = "1", default-features = false, features = ["alloc"] }  # JSON
 
 [build-dependencies]
 embuild = "0.33"
