@@ -1,68 +1,59 @@
-use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
-use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::hal::units::FromValueType;
-
-use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use display_interface_i2c::I2CInterface;
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
+    mono_font::MonoTextStyleBuilder,
     pixelcolor::BinaryColor,
     prelude::*,
     text::{Baseline, Text},
 };
+use esp_idf_svc::hal::gpio::{Gpio16, Gpio17};
+use esp_idf_svc::hal::i2c::I2C0;
+use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
+use esp_idf_svc::hal::units::FromValueType;
+use ssd1306::mode::BufferedGraphicsMode;
+use ssd1306::{prelude::*, Ssd1306};
 
-pub fn run() {
-    esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+pub type Display = Ssd1306<
+    I2CInterface<I2cDriver<'static>>,
+    DisplaySize128x32,
+    BufferedGraphicsMode<DisplaySize128x32>,
+>;
 
-    log::info!("Display Test startet...");
-
-    // Hardware initialisieren
-    let peripherals = Peripherals::take().unwrap();
-    let i2c = peripherals.i2c0;
-    let sda = peripherals.pins.gpio21;
-    let scl = peripherals.pins.gpio22;
-
-    // I2C Bus konfigurieren
-    let config = I2cConfig::new().baudrate(400u32.kHz().into());
-    let i2c = I2cDriver::new(i2c, sda, scl, &config).unwrap();
-
-    // Display initialisieren
-    let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(
-        interface,
-        DisplaySize128x32,
-        DisplayRotation::Rotate0,
-    )
-    .into_buffered_graphics_mode();
-
+pub fn init(i2c: I2C0<'static>, sda: Gpio16<'static>, scl: Gpio17<'static>) -> Display {
+    let config = I2cConfig::new().baudrate(100u32.kHz().into());
+    let i2c_driver = I2cDriver::new(i2c, sda, scl, &config).unwrap();
+    let interface = I2CInterface::new(i2c_driver, 0x3C, 0x40);
+    let mut display = Ssd1306::new(interface, DisplaySize128x32, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
     display.init().unwrap();
+    display
+}
 
-    // Text Stil definieren
+pub fn show(display: &mut Display, temperature: f32, humidity: f32, time: &str) {
+    use embedded_graphics::mono_font::ascii::FONT_9X18;
+    display.clear(BinaryColor::Off).unwrap();
+
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(&FONT_9X18)
         .text_color(BinaryColor::On)
         .build();
 
-    // Text auf Display schreiben
-    Text::with_baseline(
-        "Hello",
-        Point::new(28, 4),
-        text_style,
-        Baseline::Top,
+    let mut line1 = heapless::String::<32>::new();
+    core::fmt::write(
+        &mut line1,
+        format_args!("{:.1}C {:.0}%", temperature, humidity),
     )
-    .draw(&mut display)
-    .unwrap();
-    Text::with_baseline(
-        "World!",
-        Point::new(16,18),
-        text_style,
-        Baseline::Top
-    )
-    .draw(&mut display)
     .unwrap();
 
-    // Display aktualisieren
+    // let mut lin2 = heapless::String::<32>::new();
+    // core::fmt::write(&mut line1, format_args!("Humi: {:.1}%", humidity)).unwrap();
+
+    Text::with_baseline(&line1, Point::new(0, 4), text_style, Baseline::Top)
+        .draw(display)
+        .unwrap();
+
+    Text::with_baseline(time, Point::new(0, 18), text_style, Baseline::Top)
+        .draw(display)
+        .unwrap();
+
     display.flush().unwrap();
-
-    log::info!("Text auf Display geschrieben!");
 }

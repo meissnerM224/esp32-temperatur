@@ -1,116 +1,118 @@
-// sensor_dht.rs
-use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::gpio::{AnyIOPin, InputOutput, PinDriver, Pull};
-use esp_idf_svc::hal::peripherals::Peripherals;
-
 use crate::sensor::{SensorData, SensorResult};
+use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::gpio::{InputOutput, PinDriver};
+use esp_idf_svc::hal::interrupt;
 
-const BIT_THRESHOLD_US: u64 = 35;
+const BIT_SAMPLE_US: u64 = 45;
+
+#[inline(always)]
+
+fn now_us() -> u64 {
+    unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
+}
+
+#[inline(always)]
+
+fn busy_wait_us(us: u64) {
+    let start = now_us();
+
+    while now_us().wrapping_sub(start) < us {}
+}
+
+#[inline(always)]
 
 fn wait_for_pin_state(
-    pin: &PinDriver<InputOutput>,
+    pin: &PinDriver<'_, InputOutput>,
+
     high: bool,
+
     timeout_us: u64,
-) -> Result<u64, &'static str> {
-    let start = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+) -> Result<(), &'static str> {
+    let start = now_us();
+
     loop {
-        let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-        let elapsed = now - start;
-        if elapsed > timeout_us {
-            return Err("Timeout");
-        }
         if pin.is_high() == high {
-            return Ok(elapsed);
+            return Ok(());
+        }
+
+        if now_us().wrapping_sub(start) > timeout_us {
+            return Err("Timeout");
         }
     }
 }
 
-pub fn read() -> SensorResult {
-    let peripherals = match Peripherals::take() {
-        Ok(p) => p,
-        Err(_) => return SensorResult::Err("Peripherals bereits belegt"),
-    };
+fn read_frame(io: &PinDriver<'_, InputOutput>) -> Result<[u8; 5], &'static str> {
+    // Sensor-Antwort: LOW ca. 80us, HIGH ca. 80us, dann LOW vor Bit 0.
 
-    let pin: AnyIOPin = peripherals.pins.gpio21.into();
-    let mut io = PinDriver::input_output_od(pin, Pull::Up).unwrap();
+    wait_for_pin_state(io, false, 200).map_err(|_| "Kein Handshake LOW")?;
 
-    FreeRtos::delay_ms(1000);
+    wait_for_pin_state(io, true, 200).map_err(|_| "Kein Handshake HIGH")?;
 
-    io.set_high().unwrap();
-    FreeRtos::delay_ms(500);
+    wait_for_pin_state(io, false, 200).map_err(|_| "Kein Bit-Start")?;
 
-    io.set_low().unwrap();
-    FreeRtos::delay_ms(25);
-
-    io.set_high().unwrap();
-
-    unsafe {
-        let start = esp_idf_svc::sys::esp_timer_get_time() as u64;
-        while (esp_idf_svc::sys::esp_timer_get_time() as u64 - start) < 40 {}
-    }
-
-    // CriticalSection VOR dem Handshake
-    let cs = esp_idf_svc::hal::task::CriticalSection::new();
-    let _guard = cs.enter();
-
-    // Warte bis Sensor LOW zieht (Handshake Start)
-    if wait_for_pin_state(&io, false, 500).is_err() {
-        drop(_guard);
-        return SensorResult::Err("Kein Handshake LOW");
-    }
-    // Warte bis Sensor wieder HIGH geht (Handshake Ende)
-    if wait_for_pin_state(&io, true, 500).is_err() {
-        drop(_guard);
-        return SensorResult::Err("Kein Handshake HIGH");
-    }
-    // Warte bis Sensor LOW zieht — das ist der Start von Bit 0
-    if wait_for_pin_state(&io, false, 500).is_err() {
-        drop(_guard);
-        return SensorResult::Err("Kein Bit-Start");
-    }
-
-    // Jetzt sind wir exakt am Anfang von Bit 0
     let mut data = [0u8; 5];
-    let mut timings = [0u64; 40];
 
-    for byte_idx in 0..5 {
-        for bit_idx in 0..8 {
-            // Warte auf HIGH — Bit beginnt
-            if wait_for_pin_state(&io, true, 1000).is_err() {
-                drop(_guard);
-                return SensorResult::Err("Bit HIGH Timeout");
-            }
+    for bit in 0..40 {
+        // Jedes Bit: erst 50us LOW, dann HIGH-Puls.
+        wait_for_pin_state(io, true, 120).map_err(|_| "Bit HIGH Timeout")?;
 
-            // Messe wie lange HIGH
-            let duration = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+        // Nach 45us unterscheiden:
+        // 0-Puls ist dann schon LOW, 1-Puls ist noch HIGH.
+        busy_wait_us(BIT_SAMPLE_US);
+        if io.is_high() {
+            data[bit / 8] |= 1 << (7 - (bit % 8));
+        }
 
-            // Warte bis LOW — Bit endet
-            let is_last_bit = byte_idx == 4 && bit_idx == 7;
-            let pin_went_low = wait_for_pin_state(&io, false, 5000).is_ok();
-
-            let high_duration = if pin_went_low || is_last_bit {
-                (unsafe { esp_idf_svc::sys::esp_timer_get_time() }) as u64 - duration
-            } else {
-                drop(_guard);
-                return SensorResult::Err("Bit Dauer Timeout");
-            };
-
-            timings[byte_idx * 8 + bit_idx] = high_duration;
-
-            if high_duration > BIT_THRESHOLD_US {
-                data[byte_idx] |= 1 << (7 - bit_idx);
-            }
+        // Für das nächste Bit wieder auf LOW synchronisieren.
+        // Beim letzten Bit nicht hart fehlschlagen, weil danach die Leitung freigegeben werden kann.
+        if bit < 39 {
+            wait_for_pin_state(io, false, 120).map_err(|_| "Bit LOW Timeout")?;
+        } else {
+            let _ = wait_for_pin_state(io, false, 120);
         }
     }
 
-    drop(_guard);
+    let checksum = data[0]
+        .wrapping_add(data[1])
+        .wrapping_add(data[2])
+        .wrapping_add(data[3]);
 
-    for i in 0..40 {
-        println!("Bit {}: {}µs", i, timings[i]);
+    if checksum != data[4] {
+        return Err("Checksum Fehler");
     }
 
+    Ok(data)
+}
+
+pub fn read(io: &mut PinDriver<InputOutput>) -> SensorResult {
+    // Für DHT11 sind 1000ms oft okay, 2000ms schaden aber nicht.
+    FreeRtos::delay_ms(2000);
+
+    // Bus freigeben.
+    io.set_high().unwrap();
+
+    FreeRtos::delay_ms(10);
+
+    // Startsignal. 25ms ist für DHT11 und DHT22 lang genug.
+    io.set_low().unwrap();
+
+    FreeRtos::delay_ms(25);
+
+    // Leitung freigeben, dann 20-40us warten.
+    io.set_high().unwrap();
+
+    busy_wait_us(40);
+
+    let data = match interrupt::free(|| read_frame(&io)) {
+        Ok(data) => data,
+
+        Err(e) => return SensorResult::Err(e),
+    };
+
+    // DHT11-Dekodierung:
     SensorResult::Ok(SensorData {
-        temperature: data[2] as f32,
-        humidity: data[0] as f32,
+        humidity: data[0] as f32 + data[1] as f32 / 10.0,
+
+        temperature: data[2] as f32 + data[3] as f32 / 10.0,
     })
 }
